@@ -1,0 +1,287 @@
+import abc
+from typing import List, Dict, Union, Tuple
+from datetime import datetime, timedelta
+import random
+import hashlib
+import jwt
+import requests
+from dataclasses import dataclass
+import asyncio
+import aiohttp
+from decimal import Decimal
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Custom Exceptions
+class InsufficientFundsError(Exception):
+    pass
+
+class AccountNotFoundError(Exception):
+    pass
+
+class InvalidCurrencyError(Exception):
+    pass
+
+class AuthenticationError(Exception):
+    pass
+
+# Data Models
+@dataclass
+class Currency:
+    code: str
+    name: str
+    symbol: str
+
+@dataclass
+class ExchangeRate:
+    from_currency: str
+    to_currency: str
+    rate: Decimal
+    timestamp: datetime
+
+class Transaction:
+    def __init__(self, amount: Decimal, transaction_type: str, currency: Currency):
+        self.amount = amount
+        self.type = transaction_type
+        self.currency = currency
+        self.timestamp = datetime.now()
+
+    def __str__(self):
+        return f"{self.timestamp}: {self.type} - {self.currency.symbol}{self.amount:.2f} {self.currency.code}"
+
+class Account(abc.ABC):
+    def __init__(self, account_number: str, currency: Currency, balance: Decimal = Decimal('0')):
+        self.account_number = account_number
+        self.currency = currency
+        self._balance = balance
+        self.transactions: List[Transaction] = []
+
+    @property
+    def balance(self):
+        return self._balance
+
+    @abc.abstractmethod
+    async def withdraw(self, amount: Decimal):
+        pass
+
+    @abc.abstractmethod
+    async def deposit(self, amount: Decimal):
+        pass
+
+    def add_transaction(self, amount: Decimal, transaction_type: str):
+        self.transactions.append(Transaction(amount, transaction_type, self.currency))
+
+    def get_statement(self):
+        return "\n".join(str(transaction) for transaction in self.transactions)
+
+class SavingsAccount(Account):
+    def __init__(self, account_number: str, currency: Currency, balance: Decimal = Decimal('0'), interest_rate: Decimal = Decimal('0.01')):
+        super().__init__(account_number, currency, balance)
+        self.interest_rate = interest_rate
+
+    async def withdraw(self, amount: Decimal):
+        if amount > self._balance:
+            raise InsufficientFundsError("Insufficient funds for withdrawal")
+        self._balance -= amount
+        self.add_transaction(-amount, "Withdrawal")
+
+    async def deposit(self, amount: Decimal):
+        self._balance += amount
+        self.add_transaction(amount, "Deposit")
+
+    async def apply_interest(self):
+        interest = self._balance * self.interest_rate
+        self._balance += interest
+        self.add_transaction(interest, "Interest")
+
+class CheckingAccount(Account):
+    def __init__(self, account_number: str, currency: Currency, balance: Decimal = Decimal('0'), overdraft_limit: Decimal = Decimal('100')):
+        super().__init__(account_number, currency, balance)
+        self.overdraft_limit = overdraft_limit
+
+    async def withdraw(self, amount: Decimal):
+        if amount > self._balance + self.overdraft_limit:
+            raise InsufficientFundsError("Exceeds overdraft limit")
+        self._balance -= amount
+        self.add_transaction(-amount, "Withdrawal")
+
+    async def deposit(self, amount: Decimal):
+        self._balance += amount
+        self.add_transaction(amount, "Deposit")
+
+class Customer:
+    def __init__(self, name: str, email: str, phone: str, password: str):
+        self.name = name
+        self.email = email
+        self.phone = phone
+        self.password_hash = self._hash_password(password)
+        self.accounts: Dict[str, Account] = {}
+
+    def _hash_password(self, password: str) -> str:
+        return hashlib.sha256(password.encode()).hexdigest()
+
+    def verify_password(self, password: str) -> bool:
+        return self._hash_password(password) == self.password_hash
+
+    def add_account(self, account: Account):
+        self.accounts[account.account_number] = account
+
+    def get_account(self, account_number: str) -> Account:
+        if account_number not in self.accounts:
+            raise AccountNotFoundError(f"Account {account_number} not found")
+        return self.accounts[account_number]
+
+class Bank:
+    def __init__(self, name: str):
+        self.name = name
+        self.customers: Dict[str, Customer] = {}
+        self.currencies: Dict[str, Currency] = {}
+        self.exchange_rates: Dict[Tuple[str, str], ExchangeRate] = {}
+        self.jwt_secret = "your-secret-key"  # In production, use a secure method to generate and store this
+
+    def add_currency(self, code: str, name: str, symbol: str):
+        self.currencies[code] = Currency(code, name, symbol)
+
+    async def update_exchange_rates(self):
+        base_url = "https://api.exchangerate-api.com/v4/latest/USD"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(base_url) as response:
+                data = await response.json()
+                for code, rate in data['rates'].items():
+                    if code in self.currencies:
+                        self.exchange_rates[("USD", code)] = ExchangeRate("USD", code, Decimal(str(rate)), datetime.now())
+        logger.info("Exchange rates updated")
+
+    def add_customer(self, customer: Customer) -> str:
+        customer_id = self._generate_customer_id(customer.email)
+        self.customers[customer_id] = customer
+        return customer_id
+
+    def get_customer(self, customer_id: str) -> Customer:
+        if customer_id not in self.customers:
+            raise ValueError(f"Customer {customer_id} not found")
+        return self.customers[customer_id]
+
+    def create_account(self, customer_id: str, account_type: str, currency_code: str, initial_balance: Decimal = Decimal('0')) -> str:
+        customer = self.get_customer(customer_id)
+        account_number = self._generate_account_number()
+        currency = self.currencies.get(currency_code)
+        if not currency:
+            raise InvalidCurrencyError(f"Invalid currency code: {currency_code}")
+        
+        if account_type.lower() == 'savings':
+            account = SavingsAccount(account_number, currency, initial_balance)
+        elif account_type.lower() == 'checking':
+            account = CheckingAccount(account_number, currency, initial_balance)
+        else:
+            raise ValueError("Invalid account type")
+
+        customer.add_account(account)
+        return account_number
+
+    def _generate_customer_id(self, email: str) -> str:
+        return hashlib.md5(email.encode()).hexdigest()[:8]
+
+    def _generate_account_number(self) -> str:
+        return ''.join([str(random.randint(0, 9)) for _ in range(10)])
+
+    def login(self, email: str, password: str) -> str:
+        customer_id = self._generate_customer_id(email)
+        customer = self.customers.get(customer_id)
+        if not customer or not customer.verify_password(password):
+            raise AuthenticationError("Invalid email or password")
+        return self._generate_jwt(customer_id)
+
+    def _generate_jwt(self, customer_id: str) -> str:
+        payload = {
+            'customer_id': customer_id,
+            'exp': datetime.utcnow() + timedelta(days=1)
+        }
+        return jwt.encode(payload, self.jwt_secret, algorithm='HS256')
+
+    def verify_jwt(self, token: str) -> str:
+        try:
+            payload = jwt.decode(token, self.jwt_secret, algorithms=['HS256'])
+            return payload['customer_id']
+        except jwt.ExpiredSignatureError:
+            raise AuthenticationError("Token has expired")
+        except jwt.InvalidTokenError:
+            raise AuthenticationError("Invalid token")
+
+    async def transfer(self, from_account: Account, to_account: Account, amount: Decimal):
+        if from_account.currency != to_account.currency:
+            exchange_rate = self.exchange_rates.get((from_account.currency.code, to_account.currency.code))
+            if not exchange_rate:
+                raise InvalidCurrencyError("Exchange rate not available")
+            converted_amount = amount * exchange_rate.rate
+        else:
+            converted_amount = amount
+
+        await from_account.withdraw(amount)
+        await to_account.deposit(converted_amount)
+
+    async def generate_analytics(self, customer_id: str) -> Dict[str, Union[Decimal, int]]:
+        customer = self.get_customer(customer_id)
+        total_balance = Decimal('0')
+        total_transactions = 0
+        for account in customer.accounts.values():
+            total_balance += account.balance
+            total_transactions += len(account.transactions)
+        return {
+            "total_balance": total_balance,
+            "total_transactions": total_transactions,
+            "average_transaction_amount": total_balance / total_transactions if total_transactions > 0 else Decimal('0')
+        }
+
+async def main():
+    # Initialize the bank
+    bank = Bank("Global Bank")
+
+    # Add currencies
+    bank.add_currency("USD", "US Dollar", "$")
+    bank.add_currency("EUR", "Euro", "€")
+    bank.add_currency("GBP", "British Pound", "£")
+
+    # Update exchange rates
+    await bank.update_exchange_rates()
+
+    # Create a customer
+    customer = Customer("John Doe", "john@example.com", "555-1234", "securepassword")
+    customer_id = bank.add_customer(customer)
+
+    # Login
+    token = bank.login("john@example.com", "securepassword")
+    print(f"Login successful. Token: {token}")
+
+    # Create accounts for the customer
+    savings_account = bank.create_account(customer_id, "savings", "USD", Decimal('1000'))
+    checking_account = bank.create_account(customer_id, "checking", "EUR", Decimal('500'))
+
+    # Perform some transactions
+    customer = bank.get_customer(customer_id)
+    await customer.get_account(savings_account).deposit(Decimal('500'))
+    await customer.get_account(checking_account).withdraw(Decimal('200'))
+
+    # Apply interest to savings account
+    await customer.get_account(savings_account).apply_interest()
+
+    # Perform a transfer
+    await bank.transfer(customer.get_account(savings_account), customer.get_account(checking_account), Decimal('300'))
+
+    # Generate analytics
+    analytics = await bank.generate_analytics(customer_id)
+
+    # Print account statements and analytics
+    print(f"Savings Account (USD) Statement for {customer.name}:")
+    print(customer.get_account(savings_account).get_statement())
+    print(f"\nChecking Account (EUR) Statement for {customer.name}:")
+    print(customer.get_account(checking_account).get_statement())
+    print(f"\nAnalytics for {customer.name}:")
+    print(f"Total Balance: ${analytics['total_balance']:.2f}")
+    print(f"Total Transactions: {analytics['total_transactions']}")
+    print(f"Average Transaction Amount: ${analytics['average_transaction_amount']:.2f}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
